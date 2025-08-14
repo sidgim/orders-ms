@@ -1,17 +1,21 @@
 import {
+  BadRequestException,
   HttpStatus,
   Inject,
   Injectable,
   Logger,
+  NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
 import { CreateOrderDto } from './dto/create-order.dto';
-import { PrismaClient } from '@prisma/client';
-import { ClientProxy, RpcException } from '@nestjs/microservices';
+import { Order, PrismaClient } from '@prisma/client';
+import { ClientProxy } from '@nestjs/microservices';
 import { OrderPaginationDto } from './dto/order-pagination.dto';
-import { ChangeOrderStatusDto } from './dto';
+import { ChangeOrderStatusDto, PaidOrderDto } from './dto';
 import { NATS_SERVICE } from '@app/config/services';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from '@app/interfaces/order-whit-products.interface';
+import { PaymentSessionDto } from './dto/payment-session.dto';
 
 export type Product = {
   id: number;
@@ -34,91 +38,55 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     this.logger.log('OrdersService connected to database');
   }
   async create(createOrderDto: CreateOrderDto) {
-    try {
-      const productIds = createOrderDto.items.map((item) => item.productId);
-      // obtengo los productos del microservicio de productos
-      const products: Product[] = await firstValueFrom(
-        this.client.send({ cmd: 'validate_products' }, productIds),
+    const productIds = createOrderDto.items.map((item) => item.productId);
+    const products: Product[] = await firstValueFrom(
+      this.client.send({ cmd: 'validate_products' }, productIds),
+    );
+
+    if (products.length !== createOrderDto.items.length) {
+      throw new BadRequestException(
+        'Algunos productos no están disponibles o no existen.',
       );
-      if (products.length !== createOrderDto.items.length) {
-        throw new RpcException({
-          status: HttpStatus.BAD_REQUEST,
-          message: 'Some products are not available',
-        });
-      }
-      const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
-        const product = products.find((p) => p.id === orderItem.productId);
-        if (!product) {
-          throw new RpcException({
-            status: HttpStatus.BAD_REQUEST,
-            message: `Product with id ${orderItem.productId} not found`,
-          });
-        }
-        return product.price * orderItem.quantity + acc;
-      }, 0);
-
-      const totalItems = createOrderDto.items.reduce(
-        (acc, orderItem) => acc + orderItem.quantity,
-        0,
-      );
-
-      const order = await this.order.create({
-        data: {
-          totalAmount,
-          totalItems,
-          orderItems: {
-            createMany: {
-              data: createOrderDto.items.map((item) => {
-                const product = products.find((p) => p.id === item.productId);
-                if (!product) {
-                  throw new RpcException({
-                    status: HttpStatus.BAD_REQUEST,
-                    message: `Product with id ${item.productId} not found`,
-                  });
-                }
-                return {
-                  productId: item.productId,
-                  quantity: item.quantity,
-                  price: product.price,
-                };
-              }),
-            },
-          },
-        },
-        include: {
-          orderItems: {
-            select: {
-              price: true,
-              quantity: true,
-              productId: true,
-            },
-          },
-        },
-      });
-
-      return {
-        ...order,
-        orderItems: order.orderItems.map((orderItem) => {
-          const product = products.find((p) => p.id === orderItem.productId);
-          // Punto de error 3: se verifica si el producto existe
-          if (!product) {
-            return {
-              ...orderItem,
-              name: 'Producto no encontrado',
-            };
-          }
-          return {
-            ...orderItem,
-            name: product.name,
-          };
-        }),
-      };
-    } catch (error) {
-      throw new RpcException({
-        status: HttpStatus.BAD_REQUEST,
-        message: JSON.stringify(error),
-      });
     }
+
+    const productsMap = new Map(products.map((p) => [p.id, p]));
+
+    const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
+      const product = productsMap.get(orderItem.productId)!;
+      return acc + product.price * orderItem.quantity;
+    }, 0);
+
+    const totalItems = createOrderDto.items.reduce(
+      (acc, orderItem) => acc + orderItem.quantity,
+      0,
+    );
+
+    const order = await this.order.create({
+      data: {
+        totalAmount,
+        totalItems,
+        orderItems: {
+          createMany: {
+            data: createOrderDto.items.map((item) => ({
+              productId: item.productId,
+              quantity: item.quantity,
+              price: productsMap.get(item.productId)!.price,
+            })),
+          },
+        },
+      },
+      include: {
+        orderItems: true,
+      },
+    });
+
+    return {
+      ...order,
+      orderItems: order.orderItems.map((orderItem) => ({
+        ...orderItem,
+        name: productsMap.get(orderItem.productId)!.name,
+      })),
+    };
   }
 
   async findAll(orderPaginationDto: OrderPaginationDto) {
@@ -156,10 +124,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       },
     });
     if (!order) {
-      throw new RpcException({
-        status: HttpStatus.NOT_FOUND,
-        message: `Order with id ${id} not found`,
-      });
+      throw new NotFoundException(`Order with id ${id} not found`);
     }
     const productsId = order.orderItems.map((item) => item.productId);
     const products: Product[] = await firstValueFrom(
@@ -182,11 +147,49 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       data: { status: changeOrderStatusDto.status },
     });
     if (!order) {
-      throw new RpcException({
-        status: HttpStatus.NOT_FOUND,
-        message: `Order with id ${changeOrderStatusDto.id} not found`,
-      });
+      throw new NotFoundException(
+        `Order with id ${changeOrderStatusDto.id} not found`,
+      );
     }
+    return order;
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    const paymentSession: PaymentSessionDto = await firstValueFrom(
+      this.client.send('create.payment.session', {
+        orderId: order.id,
+        currency: 'usd',
+        items: order.orderItems.map((item) => ({
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+        })),
+      }),
+    );
+    return paymentSession;
+  }
+
+  async paidOrder(paidOrderDto: PaidOrderDto): Promise<Order> {
+    const order = await this.order.update({
+      where: { id: paidOrderDto.orderId },
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+
+        //La relación
+        orderReceipts: {
+          create: {
+            receiptUrl: paidOrderDto.receiptUrl,
+          },
+        },
+      },
+      include: {
+        orderItems: true,
+        orderReceipts: true,
+      },
+    });
     return order;
   }
 }
